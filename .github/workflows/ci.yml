@@ -55,6 +55,21 @@ jobs:
     - name: Check formatting
       run: cargo fmt --all --check
 
+  clippy:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Install Rust
+      uses: dtolnay/rust-toolchain@master
+      with:
+        toolchain: stable
+        components: clippy
+
+    - name: Run clippy with warnings as errors
+      run: cargo clippy --all-targets -- -D warnings
+
   docs:
     runs-on: ubuntu-latest
     steps:

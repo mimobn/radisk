@@ -2,17 +2,12 @@ use crate::radial::{Segment, DEGREE_FACTOR};
 
 /// Color scheme matching FileLight's implementation
 #[allow(dead_code)]
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub enum ColorScheme {
+    #[default]
     Rainbow,
     HighContrast,
-    KDE,
-}
-
-impl Default for ColorScheme {
-    fn default() -> Self {
-        ColorScheme::Rainbow
-    }
+    Kde,
 }
 
 /// Configuration for color generation
@@ -113,7 +108,7 @@ pub fn colorize_segment(segment: &Segment, depth: usize, config: &ColorConfig) -
     match config.scheme {
         ColorScheme::Rainbow => rainbow_colorize(segment, depth, config.contrast),
         ColorScheme::HighContrast => high_contrast_colorize(segment, depth, config.contrast),
-        ColorScheme::KDE => kde_colorize(segment, depth),
+        ColorScheme::Kde => kde_colorize(segment, depth),
     }
 }
 
@@ -291,12 +286,9 @@ mod tests {
     fn test_hue_from_angle() {
         let seg = make_segment(5760, false, false); // 360 degrees
         let config = ColorConfig::default();
-        let colors = colorize_segment(&seg, 0, &config);
-
-        // Should produce a valid color (not panicking)
-        assert!(colors.fill.r <= 255);
-        assert!(colors.fill.g <= 255);
-        assert!(colors.fill.b <= 255);
+        // Should produce a color without panicking; r/g/b are u8 so range
+        // bounds are guaranteed by the type system.
+        let _ = colorize_segment(&seg, 0, &config);
     }
 
     #[test]
@@ -381,36 +373,43 @@ mod tests {
     fn test_color_at_angle_zero() {
         let seg = make_segment(0, false, false);
         let config = ColorConfig::default();
-        let colors = colorize_segment(&seg, 0, &config);
-
-        // Should produce valid RGB
-        assert!(colors.fill.r <= 255);
-        assert!(colors.fill.g <= 255);
-        assert!(colors.fill.b <= 255);
+        // Smoke test: angle 0 must not panic; r/g/b ranges are u8-bounded.
+        let _ = colorize_segment(&seg, 0, &config);
     }
 
     #[test]
     fn test_color_at_angle_360() {
-        let seg = make_segment(5760, false, false); // 360 * 16
+        let seg_zero = make_segment(0, false, false);
+        let seg_full = make_segment(5760, false, false); // 360 * 16
         let config = ColorConfig::default();
-        let colors = colorize_segment(&seg, 0, &config);
 
-        // Should wrap around (same as 0 degrees)
-        assert!(colors.fill.r <= 255);
-        assert!(colors.fill.g <= 255);
-        assert!(colors.fill.b <= 255);
+        let at_zero = colorize_segment(&seg_zero, 0, &config);
+        let at_full = colorize_segment(&seg_full, 0, &config);
+
+        // 360° should wrap to the same hue as 0°.
+        assert_eq!(
+            (at_zero.fill.r, at_zero.fill.g, at_zero.fill.b),
+            (at_full.fill.r, at_full.fill.g, at_full.fill.b),
+            "wrap-around at 360° should produce the same colour as 0°"
+        );
     }
 
     #[test]
     fn test_fake_segment_colors() {
-        let seg = make_segment(1000, false, true);
+        let real = make_segment(1000, false, false);
+        let fake = make_segment(1000, false, true);
         let config = ColorConfig::default();
-        let colors = colorize_segment(&seg, 0, &config);
 
-        // Fake segments should have valid colors
-        assert!(colors.fill.r <= 255);
-        assert!(colors.fill.g <= 255);
-        assert!(colors.fill.b <= 255);
+        // Fake segments should be visually distinguishable from real ones at
+        // the same angle/depth; otherwise the "Other" bucket would be
+        // indistinguishable from a real entry of the same size.
+        let real_colors = colorize_segment(&real, 0, &config);
+        let fake_colors = colorize_segment(&fake, 0, &config);
+        assert_ne!(
+            (real_colors.fill.r, real_colors.fill.g, real_colors.fill.b),
+            (fake_colors.fill.r, fake_colors.fill.g, fake_colors.fill.b),
+            "fake segments must render distinctly from real segments"
+        );
     }
 
     #[test]
@@ -429,9 +428,9 @@ mod tests {
             let idx = rgb_to_xterm256(color);
             let back = xterm256_to_rgb(idx);
             // Should be reasonably close (xterm has limited palette)
-            let dr = (color.r as i16 - back.r as i16).abs() as u8;
-            let dg = (color.g as i16 - back.g as i16).abs() as u8;
-            let db = (color.b as i16 - back.b as i16).abs() as u8;
+            let dr = (color.r as i16 - back.r as i16).unsigned_abs() as u8;
+            let dg = (color.g as i16 - back.g as i16).unsigned_abs() as u8;
+            let db = (color.b as i16 - back.b as i16).unsigned_abs() as u8;
             assert!(
                 dr <= 51 && dg <= 51 && db <= 51,
                 "Color conversion too far off"

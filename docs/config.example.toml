@@ -1,0 +1,113 @@
+# radisk configuration
+#
+# Place this file at one of:
+#   $XDG_CONFIG_HOME/radisk/config.toml      (typical Linux)
+#   ~/.config/radisk/config.toml             (fallback Linux)
+#   ~/Library/Application Support/radisk/config.toml   (macOS)
+#   %APPDATA%\radisk\config.toml             (Windows)
+#
+# Or pass an explicit path: `radisk --config /some/path.toml`.
+#
+# Every key below is optional; missing keys fall back to the compiled-in
+# defaults shown in the comments. A completely empty file is valid and
+# behaves exactly like running with no config at all.
+
+# ─── Display ────────────────────────────────────────────────────────────
+[display]
+# Number of concentric rings to draw. 1..=20. Default: 5.
+# Overridable on the command line with `-d` / `--depth`.
+ring_depth = 5
+
+# Width of the sidebar as a percentage of the terminal width. Clamped to
+# 10..=60 at load time. Default: 25.
+sidebar_percent = 25
+
+
+# ─── Scanner ────────────────────────────────────────────────────────────
+[scan]
+# Whether the walker descends into symlinked directories. Disabled by
+# default — matches `du`/`ncdu` semantics and avoids loops.
+follow_symlinks = false
+
+# Hard recursion ceiling. Defaults to 4096 (DEFAULT_MAX_DEPTH), well
+# above any practical filesystem depth, with plenty of stack headroom.
+# Lower it if you only want to look at the top few levels of a tree.
+max_depth = 4096
+
+# Use apparent file size (`metadata.len()`, what `ls -l` shows) instead
+# of on-disk size (`st_blocks * 512`, what `du` shows). The two diverge
+# for sparse files, transparently-compressed filesystems, and CoW
+# snapshots. Toggleable in-app with the `toggle_apparent_size` action
+# (default chord: `a`).
+use_apparent_size = false
+
+# Glob patterns to skip during the walk. Matched against the full path
+# and the base name, so `node_modules` and `**/target/**` both work.
+# Bad patterns are reported as warnings and ignored; they never abort
+# a scan. Repeatable on the command line via `--exclude PATTERN`.
+# exclude = [
+#     "node_modules",
+#     ".git",
+#     "**/target/**",
+# ]
+
+
+# ─── Keybinds ───────────────────────────────────────────────────────────
+# Each entry rebinds an action to a single chord. Specifying an action
+# REPLACES every default chord for it (e.g. `quit = "ctrl+q"` removes
+# both the default `q` and `Esc` bindings for Quit).
+#
+# Chord syntax:
+#   - bare characters:  "q"  "?"  "+"  "-"  "="
+#   - named keys:       "esc" "enter" "tab" "backspace" "delete" "space"
+#                       "up" "down" "left" "right"
+#                       "home" "end" "pageup" "pagedown"
+#                       "f1" .. "f12"
+#   - modifiers (case-insensitive, joined by '+'):
+#                       "ctrl"  "shift"  "alt"  "super"
+#
+# Example:    "ctrl+shift+up"   "alt+enter"   "ctrl+c"
+#
+# Recognised actions:
+#   quit, help, navigate_up, navigate_into,
+#   zoom_in, zoom_out, rescan, delete,
+#   toggle_focus, move_up, move_down,
+#   toggle_view, cycle_sort, toggle_apparent_size,
+#   toggle_select, delete_selected, clear_selection,
+#   show_owner
+[keybinds]
+# quit                 = "ctrl+q"
+# help                 = "?"
+# navigate_up          = "u"
+# navigate_into        = "enter"
+# zoom_in              = "+"
+# zoom_out             = "-"
+# rescan               = "r"
+# delete               = "d"
+# toggle_focus         = "tab"
+# move_up              = "k"
+# move_down            = "j"
+# toggle_view          = "v"          # cycle radial / tree / largest
+# cycle_sort           = "shift+s"    # size↓ → size↑ → name → size↓
+# toggle_apparent_size = "a"          # apparent ↔ on-disk (rescans)
+# toggle_select        = "space"      # add/remove from multi-select
+# delete_selected      = "shift+d"    # batch delete every selected item
+# clear_selection      = "shift+x"    # drop the multi-select set
+# show_owner           = "o"          # query package ownership in status bar
+
+
+# ─── Colors ─────────────────────────────────────────────────────────────
+# Hex (#rrggbb, true colour) or ansi:N (0..=255 indexed palette) per
+# role. Indexed lets wallust/pywal users have radisk follow their
+# terminal-theme manager without restating every hex value.
+#
+# Roles: foreground, file, folder, selection_bg, border,
+#        border_focused, status
+[colors]
+# foreground     = "#e0e0e0"
+# file           = "#a0d8b3"
+# folder         = "#3a8fb7"
+# selection_bg   = "ansi:8"
+# border         = "ansi:240"
+# border_focused = "#f5c542"
+# status         = "#cccccc"

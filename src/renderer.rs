@@ -55,7 +55,7 @@ impl BrailleCell {
         self.dots == 0
     }
 
-    pub fn to_char(&self) -> char {
+    pub fn to_char(self) -> char {
         if self.dots == 0 {
             ' '
         } else {
@@ -584,6 +584,7 @@ mod tests {
             size: 1000,
             parent: None,
             path: std::path::PathBuf::from("/root"),
+            ..Default::default()
         };
         let root_folder = Folder {
             file: root_file,
@@ -599,6 +600,7 @@ mod tests {
             size: 1000,
             parent: Some(root_id),
             path: std::path::PathBuf::from("/root/big.txt"),
+            ..Default::default()
         };
         let fid = arena.add_file(file);
         arena.folder_mut(root_id).children_files.push(fid);
@@ -612,10 +614,10 @@ mod tests {
         let renderer = RadialRenderer::new(ColorConfig::default());
         let coords = CanvasCoords::new(100, 100);
 
-        // Hit test at a point in the first ring
-        let hit = renderer.hit_test(&map, 60.0, 50.0, &coords);
-        // This might or might not hit depending on exact geometry
-        // Just ensure no panic
+        // Hit test at a point in the first ring. The exact geometry depends
+        // on the synthetic test fixture, so the assertion is "no panic" — the
+        // unit tests for the geometry primitives cover correctness.
+        let _ = renderer.hit_test(&map, 60.0, 50.0, &coords);
     }
 
     #[test]
@@ -650,8 +652,9 @@ mod tests {
     fn test_center_circle_detection() {
         let coords = CanvasCoords::new(100, 100);
 
-        // Point at center
-        let (angle, radius) = coords.pixel_to_polar(50.0, 50.0);
+        // Point at center: angle is undefined at the origin, only the radius
+        // assertion is meaningful.
+        let (_angle, radius) = coords.pixel_to_polar(50.0, 50.0);
         approx::assert_relative_eq!(radius, 0.0, epsilon = 0.1);
     }
 }

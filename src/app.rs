@@ -1,13 +1,17 @@
 use crate::color::ColorConfig;
+use crate::config::Config;
 use crate::context_menu::{ContextMenu, MenuAction};
+use crate::delete::{delete as delete_path, DeleteStrategy};
+use crate::keybinds::{Action, Keybinds};
 use crate::radial::{build_radial_map, RadialConfig, RadialMap, Segment};
 use crate::renderer::{CanvasCoords, RadialRenderer};
-use crate::scanner::{self, ScanConfig, ScanProgress};
-use crate::tree::{format_size, FolderId, TreeArena, TreeItem};
+use crate::scanner::ScanProgress;
+use crate::scanner_streaming::{scan_streaming, ScanEvent, ScanHandle};
+use crate::theme::Theme;
+use crate::tree::{format_size, FolderId, SortMode, TreeArena, TreeItem};
+use crate::views::View;
 use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
 use std::path::PathBuf;
-use std::sync::mpsc;
-use std::thread;
 use uuid::Uuid;
 
 /// Application mode
@@ -41,6 +45,37 @@ pub struct App {
     pub arena: Option<TreeArena>,
     pub current_path: PathBuf,
     pub ring_depth: usize,
+    /// Resolved user configuration. Owned by the App because most config
+    /// reads are not in performance-critical paths and a single owner
+    /// avoids cloning sub-structs to event handlers.
+    pub config: Config,
+    /// Keybind table, derived from `config.keybinds` at construction
+    /// time. Looked up once per key event in `handle_viewing_key`.
+    pub keybinds: Keybinds,
+    /// Resolved colour palette for UI chrome. Built once from
+    /// `config.colors`; passed by reference to renderers.
+    pub theme: Theme,
+    /// Multi-select set keyed by absolute path. Used by the batch
+    /// delete flow (`delete_selected` action) so a user can
+    /// space-mark several entries from the sidebar and delete them
+    /// in one confirmation dialog.
+    pub selected_paths: std::collections::HashSet<PathBuf>,
+    /// Cache of pacman ownership lookups, keyed by absolute path so
+    /// repeated queries on the same row are free. Populated lazily
+    /// by the `show_owner` action.
+    pub owner_cache: std::collections::HashMap<PathBuf, crate::ownership::Owner>,
+    /// Currently active main-area view (radial, tree, …). Toggled by
+    /// the `toggle_view` action.
+    pub view: View,
+    /// User-selected ordering for sidebar and tree-view rows. Cycled
+    /// by the `cycle_sort` action; the radial layout is always
+    /// size-driven and ignores this.
+    pub sort_mode: SortMode,
+    /// How `execute_delete` removes entries. Detected once at startup
+    /// (trash-put → gio trash → permanent rm) and reused for every
+    /// delete the user issues; surfaced in the status message so
+    /// users know whether the action was recoverable.
+    pub delete_strategy: DeleteStrategy,
     pub radial_map: Option<RadialMap>,
     pub renderer: RadialRenderer,
     pub hovered_uuid: Option<Uuid>,
@@ -51,24 +86,78 @@ pub struct App {
     pub terminal_size: (u16, u16),
     pub should_quit: bool,
     pub scan_progress: Option<ScanProgress>,
-    pub scan_rx: Option<mpsc::Receiver<ScanProgress>>,
+    /// Handle to the active streaming scan, if any. `None` means there is no
+    /// scan in progress (either because we have already moved to `Viewing`
+    /// mode or because no scan has started yet).
+    pub scan_handle: Option<ScanHandle>,
+    /// Path most recently observed by the streaming scan, displayed in the
+    /// status bar so the user can see what the walker is currently chewing.
+    pub scan_current_path: Option<PathBuf>,
     pub nav_history: Vec<PathBuf>,
     pub status_message: String,
     pub canvas_coords: Option<CanvasCoords>,
     pub context_menu: ContextMenu,
     pub delete_path: Option<PathBuf>,
     pub delete_is_folder: bool,
-    pub delete_selected: bool, // true = Yes, false = No
+    /// Inode captured at scan time for the staged delete target, when
+    /// known. The delete path passes this to `delete::delete()` as a
+    /// TOCTOU guard — if the on-disk inode no longer matches when the
+    /// user confirms, the delete is refused with a clear error rather
+    /// than silently following the renamed path. `None` for folders
+    /// (we only capture inodes on files), for radial-map deletes
+    /// (the segment doesn't carry an inode), and on non-Unix builds.
+    pub delete_inode: Option<u64>,
+    /// Currently highlighted choice in the delete confirmation dialog.
+    /// `true` = Yes, `false` = No. Always initialised to `false` so a stray
+    /// Enter keypress can never trigger an irreversible deletion.
+    pub delete_selected: bool,
+    /// `true` while the user has typed `g` and we're waiting for the
+    /// follow-up keystroke that completes a vim-style two-key
+    /// sequence (currently only `gg` → jump to first item). Reset on
+    /// any non-`g` keypress.
+    pub pending_g: bool,
+    /// Currently focused folder within the arena — the "view root"
+    /// for the radial / sidebar. `None` falls through to the arena's
+    /// own root, which is the original scan target. Updated by
+    /// `navigate_into` / `navigate_up` so the user can browse the
+    /// arena without restarting the scan; the walker keeps running
+    /// in the background regardless of where the user has zoomed.
+    pub current_folder_id: Option<FolderId>,
 }
 
 impl App {
-    pub fn new(path: PathBuf, ring_depth: usize, term_width: u16, term_height: u16) -> Self {
+    pub fn new(path: PathBuf, config: Config, term_width: u16, term_height: u16) -> Self {
+        let ring_depth = config.display.ring_depth;
+        // An invalid keybind config falls back to defaults rather than
+        // refusing to start the App; the user already saw the parse
+        // error at config-load time, and locking them out of the tool
+        // because of a bad rebind is worse than running with defaults.
+        let keybinds = Keybinds::from_config(&config.keybinds).unwrap_or_else(|err| {
+            eprintln!("warning: ignoring invalid keybinds config: {:#}", err);
+            Keybinds::defaults()
+        });
+        let theme = Theme::from_config(&config.colors);
+        // Bubble theme parse warnings into the initial status
+        // message so users see typo'd hex colours at startup.
+        let initial_status = if theme.warnings.is_empty() {
+            String::new()
+        } else {
+            theme.warnings.join("; ")
+        };
         Self {
             mode: AppMode::Scanning,
             focus: Focus::Map,
             arena: None,
             current_path: path,
             ring_depth,
+            config,
+            keybinds,
+            theme,
+            selected_paths: std::collections::HashSet::new(),
+            owner_cache: std::collections::HashMap::new(),
+            view: View::default(),
+            sort_mode: SortMode::default(),
+            delete_strategy: DeleteStrategy::detect(),
             radial_map: None,
             renderer: RadialRenderer::new(ColorConfig::default()),
             hovered_uuid: None,
@@ -78,86 +167,101 @@ impl App {
             terminal_size: (term_width, term_height),
             should_quit: false,
             scan_progress: None,
-            scan_rx: None,
+            scan_handle: None,
+            scan_current_path: None,
             nav_history: Vec::new(),
-            status_message: String::new(),
+            status_message: initial_status,
             canvas_coords: None,
             context_menu: ContextMenu::new(),
             delete_path: None,
             delete_is_folder: false,
-            delete_selected: true, // Default to Yes
+            delete_inode: None,
+            // Default to No: a destructive action requires deliberate input.
+            delete_selected: false,
+            pending_g: false,
+            current_folder_id: None,
         }
     }
 
-    /// Start scanning the current path
-    pub fn start_scan(&mut self) {
-        let path = self.current_path.clone();
-        let (tx, rx) = mpsc::channel();
+    /// Resolve which folder is currently in focus — `current_folder_id`
+    /// when the user has explicitly zoomed in; otherwise the arena's
+    /// own root. Returns `None` only when no arena exists yet (early
+    /// startup, before the walker has even seeded the root).
+    pub fn focus_folder_id(&self, arena: &TreeArena) -> Option<FolderId> {
+        if let Some(id) = self.current_folder_id {
+            // Defend against a stale id from a snapshot that didn't
+            // round-trip with the current arena. The cloned post-scan
+            // arena keeps the same indices, so this `is_some` check
+            // really only fires after a snapshot import edge case.
+            if id.0 < arena.folders().len() {
+                return Some(id);
+            }
+        }
+        arena.root()
+    }
 
+    /// Kick off a streaming parallel scan of `current_path`. The walker runs
+    /// in its own thread and emits [`ScanEvent`]s back through a channel
+    /// owned by `scan_handle`. The UI loop drains the channel via
+    /// [`Self::update_scan_progress`] each frame.
+    pub fn start_scan(&mut self) {
         self.mode = AppMode::Scanning;
-        self.scan_rx = Some(rx);
         self.scan_progress = Some(ScanProgress {
             files_scanned: 0,
             total_size: 0,
         });
+        self.scan_current_path = None;
+        // Drop any prior radial map so the canvas shows "scanning" placeholder
+        // instead of stale data when the user re-scans a different path.
+        self.radial_map = None;
+        self.arena = None;
+        // Reset zoom focus — a fresh scan rebuilds the arena from
+        // scratch, so any prior focus FolderId is meaningless.
+        self.current_folder_id = None;
+        self.sidebar_index = 0;
 
-        // Spawn scan thread
-        thread::spawn(move || {
-            let config = ScanConfig::default();
-            match scanner::scan_with_progress(&path, &config, Some(tx.clone())) {
-                Ok(arena) => {
-                    // Send final progress
-                    let root_id = arena.root().unwrap();
-                    let _ = tx.send(ScanProgress {
-                        files_scanned: arena.total_file_count(root_id),
-                        total_size: arena.folder(root_id).file.size,
-                    });
-                    // Note: We can't send the arena through the channel easily
-                    // Instead, we'll do a synchronous scan after progress updates
-                }
-                Err(e) => {
-                    eprintln!("Scan error: {}", e);
-                }
-            }
-        });
-
-        // Also do a synchronous scan for the actual data
-        self.scan_sync();
+        let scan_config = self.config.to_scan_config();
+        self.scan_handle = Some(scan_streaming(&self.current_path, &scan_config));
     }
 
-    /// Synchronous scan (for actual data)
-    fn scan_sync(&mut self) {
-        let config = ScanConfig::default();
-        match scanner::scan_directory(&self.current_path, &config) {
-            Ok(arena) => {
-                let root_id = arena.root().unwrap();
-                self.arena = Some(arena);
-                self.mode = AppMode::Viewing;
-                self.rebuild_map();
-                self.status_message = format!(
-                    "Scanned {} files ({})",
-                    self.arena.as_ref().unwrap().total_file_count(root_id),
-                    format_size(self.arena.as_ref().unwrap().folder(root_id).file.size)
-                );
-            }
-            Err(e) => {
-                self.status_message = format!("Error: {}", e);
-                self.mode = AppMode::Viewing;
-            }
-        }
+    /// Rebuild the radial map from the live (mid-scan) arena via
+    /// `try_lock`. Skips silently if the walker holds the lock — we'll
+    /// retry on the next frame. Used by `update_scan_progress` so the
+    /// radial fills in progressively while jwalk is still running.
+    fn rebuild_map_from_live(&mut self) {
+        let Some(handle) = self.scan_handle.as_ref() else {
+            return;
+        };
+        let Ok(arena) = handle.live.try_lock() else {
+            return;
+        };
+        let Some(focus) = self.focus_folder_id(&arena) else {
+            return;
+        };
+        let config = RadialConfig {
+            ring_depth: self.ring_depth,
+            terminal_width: self.terminal_size.0,
+            terminal_height: self.terminal_size.1,
+            ..Default::default()
+        };
+        self.radial_map = Some(build_radial_map(&arena, focus, &config));
+        self.canvas_coords = Some(CanvasCoords::new(
+            self.terminal_size.0 as usize,
+            self.terminal_size.1 as usize,
+        ));
     }
 
     /// Rebuild the radial map from current state
     pub fn rebuild_map(&mut self) {
         if let Some(ref arena) = self.arena {
-            if let Some(root_id) = arena.root() {
+            if let Some(focus) = self.focus_folder_id(arena) {
                 let config = RadialConfig {
                     ring_depth: self.ring_depth,
                     terminal_width: self.terminal_size.0,
                     terminal_height: self.terminal_size.1,
                     ..Default::default()
                 };
-                self.radial_map = Some(build_radial_map(arena, root_id, &config));
+                self.radial_map = Some(build_radial_map(arena, focus, &config));
                 self.canvas_coords = Some(CanvasCoords::new(
                     self.terminal_size.0 as usize,
                     self.terminal_size.1 as usize,
@@ -176,8 +280,15 @@ impl App {
     pub fn handle_key(&mut self, key: KeyEvent) {
         match self.mode {
             AppMode::Scanning => {
-                if key.code == KeyCode::Esc || key.code == KeyCode::Char('q') {
-                    self.should_quit = true;
+                // Phase 23: full navigation works during scan. The
+                // walker keeps cataloguing in the background while
+                // the user clicks around the partial arena. Esc/q
+                // still quit, all other keys flow through the same
+                // dispatch as Viewing mode.
+                if self.context_menu.visible {
+                    self.handle_context_menu_key(key);
+                } else {
+                    self.handle_viewing_key(key);
                 }
             }
             AppMode::Viewing => {
@@ -189,7 +300,16 @@ impl App {
                 }
             }
             AppMode::Help => {
-                self.mode = AppMode::Viewing;
+                // Vim-style: `q` / `Esc` / `?` close the overlay.
+                // Any other keypress is ignored so users can't drop
+                // into a stale state by mashing keys while the help
+                // is open.
+                if matches!(
+                    key.code,
+                    KeyCode::Char('q') | KeyCode::Esc | KeyCode::Char('?') | KeyCode::Enter
+                ) {
+                    self.mode = AppMode::Viewing;
+                }
             }
             AppMode::ConfirmDelete => {
                 match key.code {
@@ -201,7 +321,16 @@ impl App {
                             self.mode = AppMode::Viewing;
                         }
                     }
-                    KeyCode::Left | KeyCode::Right | KeyCode::Char('j') | KeyCode::Char('k') => {
+                    KeyCode::Left
+                    | KeyCode::Right
+                    | KeyCode::Char('j')
+                    | KeyCode::Char('k')
+                    | KeyCode::Char('h')
+                    | KeyCode::Char('l')
+                    | KeyCode::Tab => {
+                        // Yes/No is a horizontal choice — h/l (vim
+                        // horizontal motion) and Tab join the existing
+                        // arrows / j / k as togglers.
                         self.delete_selected = !self.delete_selected;
                     }
                     KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
@@ -227,42 +356,211 @@ impl App {
     }
 
     fn handle_viewing_key(&mut self, key: KeyEvent) {
-        match key.code {
-            KeyCode::Char('q') | KeyCode::Esc => self.should_quit = true,
-            KeyCode::Char('?') => self.mode = AppMode::Help,
-            KeyCode::Char('u') | KeyCode::Backspace => self.navigate_up(),
-            KeyCode::Enter => self.navigate_into_hovered(),
-            KeyCode::Char('+') | KeyCode::Char('=') => self.zoom_in(),
-            KeyCode::Char('-') => self.zoom_out(),
-            KeyCode::Char('r') => self.start_scan(),
-            KeyCode::Char('d') => self.trigger_delete(),
-            KeyCode::Tab => self.toggle_focus(),
-            KeyCode::Up | KeyCode::Char('k') => self.move_hover_up(),
-            KeyCode::Down | KeyCode::Char('j') => self.move_hover_down(),
-            _ => {}
+        // Vim two-key sequence: `gg` jumps to the first item.
+        // The state machine here is intentionally tiny — only one
+        // sequence is supported, so a single bool is enough. Any
+        // non-`g` keystroke clears the pending state.
+        if self.pending_g {
+            self.pending_g = false;
+            if matches!(key.code, KeyCode::Char('g')) {
+                self.dispatch_action(Action::MoveToFirst);
+                return;
+            }
+            // fall through to normal dispatch below
+        } else if matches!(key.code, KeyCode::Char('g'))
+            && key.modifiers == crossterm::event::KeyModifiers::NONE
+        {
+            self.pending_g = true;
+            return;
         }
+
+        let Some(action) = self.keybinds.action_for(key) else {
+            return;
+        };
+        self.dispatch_action(action);
+    }
+
+    /// Execute a resolved [`Action`] against the App. Centralised so
+    /// future input sources (e.g. mouse-driven menu items) can fan into
+    /// the same dispatch table.
+    fn dispatch_action(&mut self, action: Action) {
+        match action {
+            Action::Quit => self.should_quit = true,
+            Action::Help => self.mode = AppMode::Help,
+            Action::NavigateUp => self.navigate_up(),
+            Action::NavigateInto => self.navigate_into_hovered(),
+            Action::ZoomIn => self.zoom_in(),
+            Action::ZoomOut => self.zoom_out(),
+            Action::Rescan => self.start_scan(),
+            Action::Delete => self.trigger_delete(),
+            Action::ToggleFocus => self.toggle_focus(),
+            Action::MoveUp => self.move_hover_up(),
+            Action::MoveDown => self.move_hover_down(),
+            Action::ToggleView => self.view = self.view.next(),
+            Action::CycleSort => {
+                self.sort_mode = self.sort_mode.next();
+                self.status_message = format!("sort: {}", self.sort_mode.label());
+            }
+            Action::ToggleApparentSize => {
+                self.config.scan.use_apparent_size = !self.config.scan.use_apparent_size;
+                self.status_message = if self.config.scan.use_apparent_size {
+                    "apparent size — rescanning…".to_string()
+                } else {
+                    "on-disk size — rescanning…".to_string()
+                };
+                // Re-walk: the size accounting changed at every node.
+                self.start_scan();
+            }
+            Action::ToggleSelect => self.toggle_select_current(),
+            Action::DeleteSelected => self.trigger_delete_selected(),
+            Action::ClearSelection => {
+                let n = self.selected_paths.len();
+                self.selected_paths.clear();
+                self.status_message = format!("Cleared {} selection(s)", n);
+            }
+            Action::ShowOwner => self.show_owner_for_current(),
+            Action::MoveToFirst => self.move_sidebar_to(0),
+            Action::MoveToLast => {
+                let n = self.sidebar_items().len();
+                if n > 0 {
+                    self.move_sidebar_to(n - 1);
+                }
+            }
+            Action::MoveHalfPageDown => self.move_sidebar_by(self.half_page_step() as isize),
+            Action::MoveHalfPageUp => self.move_sidebar_by(-(self.half_page_step() as isize)),
+        }
+    }
+
+    /// Half the visible sidebar height in rows, with a sane minimum
+    /// so a tiny terminal still moves at least one row per Ctrl-d.
+    fn half_page_step(&self) -> usize {
+        // Status bar (2) + borders (2) ≈ 4; halve the rest.
+        let rows = self.terminal_size.1.saturating_sub(4) / 2;
+        rows.max(1) as usize
+    }
+
+    fn move_sidebar_to(&mut self, idx: usize) {
+        let n = self.sidebar_items().len();
+        if n == 0 {
+            return;
+        }
+        self.sidebar_index = idx.min(n - 1);
+    }
+
+    fn move_sidebar_by(&mut self, delta: isize) {
+        let n = self.sidebar_items().len() as isize;
+        if n == 0 {
+            return;
+        }
+        let cur = self.sidebar_index as isize;
+        let next = (cur + delta).clamp(0, n - 1);
+        self.sidebar_index = next as usize;
+    }
+
+    /// Look up (or recall from cache) the pacman package owning the
+    /// current sidebar entry and surface it in the status bar. No-op
+    /// when the sidebar is empty or pacman is unavailable.
+    fn show_owner_for_current(&mut self) {
+        let Some(arena) = self.arena.as_ref() else {
+            return;
+        };
+        let items = self.sidebar_items();
+        let Some(item) = items.get(self.sidebar_index) else {
+            return;
+        };
+        let path = match item {
+            TreeItem::File(id, _) => arena.file(*id).path.clone(),
+            TreeItem::Folder(id, _) => arena.folder(*id).file.path.clone(),
+        };
+        let owner = match self.owner_cache.get(&path) {
+            Some(cached) => cached.clone(),
+            None => {
+                let fresh = crate::ownership::query(&path);
+                self.owner_cache.insert(path.clone(), fresh.clone());
+                fresh
+            }
+        };
+        self.status_message = format!("{}: {}", path.display(), owner.label());
+    }
+
+    /// Toggle the current sidebar item in/out of `selected_paths`.
+    /// No-op if the sidebar is empty or the arena hasn't loaded yet.
+    fn toggle_select_current(&mut self) {
+        let Some(arena) = self.arena.as_ref() else {
+            return;
+        };
+        let items = self.sidebar_items();
+        let Some(item) = items.get(self.sidebar_index) else {
+            return;
+        };
+        let path = match item {
+            TreeItem::File(id, _) => arena.file(*id).path.clone(),
+            TreeItem::Folder(id, _) => arena.folder(*id).file.path.clone(),
+        };
+        if self.selected_paths.remove(&path) {
+            self.status_message = format!(
+                "- {}  ({} selected)",
+                path.display(),
+                self.selected_paths.len()
+            );
+        } else {
+            self.selected_paths.insert(path.clone());
+            self.status_message = format!(
+                "+ {}  ({} selected)",
+                path.display(),
+                self.selected_paths.len()
+            );
+        }
+    }
+
+    /// Open the confirmation dialog for the multi-select batch.
+    /// Reuses the existing `ConfirmDelete` mode; the executor in
+    /// `execute_delete` walks `selected_paths` instead of the
+    /// single `delete_path` when the set is non-empty.
+    fn trigger_delete_selected(&mut self) {
+        if self.selected_paths.is_empty() {
+            self.status_message = "no items selected (space to mark, then Shift+D)".into();
+            return;
+        }
+        // Stage with a sentinel path so the existing dialog still
+        // has something to display; the actual targets come from
+        // `selected_paths`.
+        self.delete_path = None;
+        self.delete_inode = None;
+        self.delete_is_folder = false;
+        self.delete_selected = false;
+        self.mode = AppMode::ConfirmDelete;
     }
 
     /// Trigger delete action for the currently selected item
     fn trigger_delete(&mut self) {
         // Check sidebar selection first
-        let items = self.sidebar_items();
-        if let Some(item) = items.get(self.sidebar_index) {
-            let (path, is_folder) = match item {
-                TreeItem::File(id, _) => {
-                    let file = self.arena.as_ref().unwrap().file(*id);
-                    (file.path.clone(), false)
-                }
-                TreeItem::Folder(id, _) => {
-                    let folder = self.arena.as_ref().unwrap().folder(*id);
-                    (folder.file.path.clone(), true)
-                }
-            };
-            self.delete_path = Some(path);
-            self.delete_is_folder = is_folder;
-            self.delete_selected = true;
-            self.mode = AppMode::ConfirmDelete;
-            return;
+        if let Some(arena) = self.arena.as_ref() {
+            let items = self.sidebar_items();
+            if let Some(item) = items.get(self.sidebar_index) {
+                let (path, is_folder, inode) = match item {
+                    TreeItem::File(id, _) => {
+                        let file = arena.file(*id);
+                        (file.path.clone(), false, file.inode)
+                    }
+                    TreeItem::Folder(id, _) => {
+                        let folder = arena.folder(*id);
+                        // We don't currently capture folder inodes
+                        // (folders are recursive deletes; the
+                        // identity check is most meaningful for
+                        // single files). Pass None to opt out of the
+                        // TOCTOU guard for now.
+                        (folder.file.path.clone(), true, None)
+                    }
+                };
+                self.delete_path = Some(path);
+                self.delete_is_folder = is_folder;
+                self.delete_inode = inode;
+                // Always reset highlight to No when opening the dialog.
+                self.delete_selected = false;
+                self.mode = AppMode::ConfirmDelete;
+                return;
+            }
         }
 
         // Otherwise use map hover
@@ -271,7 +569,12 @@ impl App {
                 if let Some(segment) = self.renderer.find_segment(map, &uuid) {
                     self.delete_path = Some(PathBuf::from(&segment.path));
                     self.delete_is_folder = segment.is_folder;
-                    self.delete_selected = true;
+                    // The segment doesn't carry an inode; the TOCTOU
+                    // guard only fires for sidebar-driven deletes
+                    // until renderer carries inode through too.
+                    self.delete_inode = None;
+                    // Always reset highlight to No when opening the dialog.
+                    self.delete_selected = false;
                     self.mode = AppMode::ConfirmDelete;
                 }
             }
@@ -547,81 +850,100 @@ impl App {
 
     /// Sync canvas hover to sidebar
     fn sync_hover_to_sidebar(&mut self) {
-        if let Some(uuid) = self.hovered_uuid {
-            if let Some(ref map) = self.radial_map {
-                if let Some(segment) = self.renderer.find_segment(map, &uuid) {
-                    let items = self.sidebar_items();
-                    for (i, item) in items.iter().enumerate() {
-                        let item_path = match item {
-                            TreeItem::File(id, _) => self
-                                .arena
-                                .as_ref()
-                                .unwrap()
-                                .file(*id)
-                                .path
-                                .to_string_lossy()
-                                .into_owned(),
-                            TreeItem::Folder(id, _) => self
-                                .arena
-                                .as_ref()
-                                .unwrap()
-                                .folder(*id)
-                                .file
-                                .path
-                                .to_string_lossy()
-                                .into_owned(),
-                        };
-                        if item_path == segment.path {
-                            self.sidebar_hover_index = Some(i);
-                            return;
-                        }
-                    }
+        let Some(uuid) = self.hovered_uuid else {
+            self.sidebar_hover_index = None;
+            return;
+        };
+        let Some(map) = self.radial_map.as_ref() else {
+            self.sidebar_hover_index = None;
+            return;
+        };
+        let Some(segment) = self.renderer.find_segment(map, &uuid) else {
+            self.sidebar_hover_index = None;
+            return;
+        };
+        let Some(arena) = self.arena.as_ref() else {
+            self.sidebar_hover_index = None;
+            return;
+        };
+
+        let items = self.sidebar_items();
+        for (i, item) in items.iter().enumerate() {
+            let item_path = match item {
+                TreeItem::File(id, _) => arena.file(*id).path.to_string_lossy().into_owned(),
+                TreeItem::Folder(id, _) => {
+                    arena.folder(*id).file.path.to_string_lossy().into_owned()
                 }
+            };
+            if item_path == segment.path {
+                self.sidebar_hover_index = Some(i);
+                return;
             }
         }
         self.sidebar_hover_index = None;
     }
 
-    /// Sync sidebar hover to canvas
+    /// Sync sidebar hover → radial hover.
+    ///
+    /// When the lookup succeeds (exact match or the "small files" group
+    /// fallback in [`Self::find_segment_uuid_for_sidebar_hover`]), the
+    /// radial highlight tracks the sidebar cursor on every j/k. When
+    /// the lookup truly returns `None` — radial map empty, no segments
+    /// at all — we keep whatever hover was already showing rather than
+    /// flicker it off; otherwise quick keyboard navigation past the
+    /// last visible segment would blank the radial.
     fn sync_hover_to_canvas(&mut self) {
-        if let Some(hover_idx) = self.sidebar_hover_index {
-            let items = self.sidebar_items();
-            if let Some(item) = items.get(hover_idx) {
-                let path = match item {
-                    TreeItem::File(id, _) => self
-                        .arena
-                        .as_ref()
-                        .unwrap()
-                        .file(*id)
-                        .path
-                        .to_string_lossy()
-                        .into_owned(),
-                    TreeItem::Folder(id, _) => self
-                        .arena
-                        .as_ref()
-                        .unwrap()
-                        .folder(*id)
-                        .file
-                        .path
-                        .to_string_lossy()
-                        .into_owned(),
-                };
+        if let Some(uuid) = self.find_segment_uuid_for_sidebar_hover() {
+            self.hovered_uuid = Some(uuid);
+            self.renderer.set_hovered(Some(uuid));
+        }
+    }
 
-                if let Some(ref map) = self.radial_map {
-                    for ring in &map.rings {
-                        for segment in &ring.segments {
-                            if segment.path == path {
-                                self.hovered_uuid = Some(segment.uuid);
-                                self.renderer.set_hovered(Some(segment.uuid));
-                                return;
-                            }
-                        }
-                    }
+    /// Resolve the segment UUID corresponding to the currently sidebar-hovered
+    /// item, if any.
+    ///
+    /// Behaviour
+    /// - Exact path match wins.
+    /// - When the sidebar item is too small to draw its own slice — the
+    ///   radial layout rolls those into a fake "N small files" segment —
+    ///   we highlight the small-files group instead, so j/k navigation
+    ///   still produces a visible cue rather than silently clearing the
+    ///   radial hover.
+    /// - Returns `None` only when the radial layout is genuinely empty
+    ///   (no map, no segments at all). In that case the caller leaves the
+    ///   prior hover in place rather than clearing — see
+    ///   [`Self::sync_hover_to_canvas`].
+    fn find_segment_uuid_for_sidebar_hover(&self) -> Option<Uuid> {
+        let hover_idx = self.sidebar_hover_index?;
+        let arena = self.arena.as_ref()?;
+        let items = self.sidebar_items();
+        let item = items.get(hover_idx)?;
+        let path = match item {
+            TreeItem::File(id, _) => arena.file(*id).path.to_string_lossy().into_owned(),
+            TreeItem::Folder(id, _) => arena.folder(*id).file.path.to_string_lossy().into_owned(),
+        };
+        let map = self.radial_map.as_ref()?;
+
+        // Pass 1: exact path match.
+        for ring in &map.rings {
+            for segment in &ring.segments {
+                if segment.path == path {
+                    return Some(segment.uuid);
                 }
             }
         }
-        self.hovered_uuid = None;
-        self.renderer.set_hovered(None);
+        // Pass 2: the item rolled into a small-files group. Return the
+        // first ring's fake segment so the user still sees a highlight.
+        // Only the innermost ring carries a fake group for the current
+        // root, so we stop after finding one in any ring.
+        for ring in &map.rings {
+            for segment in &ring.segments {
+                if segment.is_fake {
+                    return Some(segment.uuid);
+                }
+            }
+        }
+        None
     }
 
     /// Show context menu at cursor position if hovering over a segment
@@ -632,30 +954,32 @@ impl App {
             // Click is in sidebar
             if row >= 2 {
                 let clicked_index = (row - 2) as usize;
-                let items = self.sidebar_items();
-                if let Some(item) = items.get(clicked_index) {
-                    let (name, path, is_folder) = match item {
-                        TreeItem::File(id, _) => {
-                            let file = self.arena.as_ref().unwrap().file(*id);
-                            (
-                                file.name.clone(),
-                                file.path.to_string_lossy().into_owned(),
-                                false,
-                            )
-                        }
-                        TreeItem::Folder(id, _) => {
-                            let folder = self.arena.as_ref().unwrap().folder(*id);
-                            (
-                                folder.file.name.clone(),
-                                folder.file.path.to_string_lossy().into_owned(),
-                                true,
-                            )
-                        }
-                    };
-                    // Use a dummy UUID for sidebar items since they don't have segment UUIDs
-                    self.context_menu
-                        .show(col, row, Uuid::nil(), name, path, is_folder);
-                    return;
+                if let Some(arena) = self.arena.as_ref() {
+                    let items = self.sidebar_items();
+                    if let Some(item) = items.get(clicked_index) {
+                        let (name, path, is_folder) = match item {
+                            TreeItem::File(id, _) => {
+                                let file = arena.file(*id);
+                                (
+                                    file.name.clone(),
+                                    file.path.to_string_lossy().into_owned(),
+                                    false,
+                                )
+                            }
+                            TreeItem::Folder(id, _) => {
+                                let folder = arena.folder(*id);
+                                (
+                                    folder.file.name.clone(),
+                                    folder.file.path.to_string_lossy().into_owned(),
+                                    true,
+                                )
+                            }
+                        };
+                        // Sidebar items have no segment UUID; use a sentinel.
+                        self.context_menu
+                            .show(col, row, Uuid::nil(), name, path, is_folder);
+                        return;
+                    }
                 }
             }
             return;
@@ -796,7 +1120,34 @@ impl App {
     }
 
     /// Navigate up to parent directory
+    /// Navigate up. If the current focus has a parent inside the
+    /// arena, just shift focus — no rescan, no work thrown away.
+    /// Only when we'd leave the arena root (the originally-scanned
+    /// path) do we fall back to a fresh scan rooted at the new
+    /// directory. This is what enables "go back, see your old
+    /// scan still there" without restarting.
     pub fn navigate_up(&mut self) {
+        // First, try to walk up inside the arena.
+        let in_arena_target = self.with_arena(|arena| {
+            let focus = self.focus_folder_id(arena)?;
+            let parent = arena.folder(focus).file.parent?;
+            let path = arena.folder(parent).file.path.clone();
+            Some((parent, path))
+        });
+        if let Some(Some((parent_id, path))) = in_arena_target {
+            self.nav_history.push(self.current_path.clone());
+            self.current_path = path.clone();
+            self.current_folder_id = Some(parent_id);
+            self.hovered_uuid = None;
+            self.renderer.set_hovered(None);
+            self.sidebar_index = 0;
+            self.rebuild_map();
+            self.notify_focus_change(path);
+            return;
+        }
+        // We're at the arena's root. Going further up means leaving
+        // the originally-scanned tree — that genuinely requires a
+        // fresh scan.
         if let Some(parent) = self.current_path.parent() {
             self.nav_history.push(self.current_path.clone());
             self.current_path = parent.to_path_buf();
@@ -806,34 +1157,78 @@ impl App {
         }
     }
 
-    /// Navigate into a folder
+    /// Navigate into a folder by absolute path. Used by mouse
+    /// clicks and the context menu where only the path is known
+    /// (not a `FolderId`). When the path is inside the current
+    /// arena we shift focus without restarting; otherwise this
+    /// is a "navigate to a different tree" intent and triggers a
+    /// fresh scan.
     pub fn navigate_into(&mut self, path: PathBuf) {
-        if path.is_dir() {
+        if !path.is_dir() {
+            return;
+        }
+        let in_arena_id = self.with_arena(|arena| arena.find_folder_by_path(&path));
+        if let Some(Some(folder_id)) = in_arena_id {
             self.nav_history.push(self.current_path.clone());
-            self.current_path = path;
+            self.current_path = path.clone();
+            self.current_folder_id = Some(folder_id);
             self.hovered_uuid = None;
             self.renderer.set_hovered(None);
-            self.start_scan();
+            self.sidebar_index = 0;
+            self.rebuild_map();
+            self.notify_focus_change(path);
+            return;
+        }
+        // Path is outside the current arena — fall back to a fresh
+        // scan with this as the new root.
+        self.nav_history.push(self.current_path.clone());
+        self.current_path = path;
+        self.current_folder_id = None;
+        self.hovered_uuid = None;
+        self.renderer.set_hovered(None);
+        self.start_scan();
+    }
+
+    /// Fast in-arena navigation by `FolderId` — used by sidebar /
+    /// segment clicks where we already have the target's id and
+    /// don't need a path lookup at all.
+    fn navigate_into_id(&mut self, folder_id: FolderId) {
+        let path = self.with_arena(|arena| arena.folder(folder_id).file.path.clone());
+        let Some(path) = path else { return };
+        self.nav_history.push(self.current_path.clone());
+        self.current_path = path.clone();
+        self.current_folder_id = Some(folder_id);
+        self.hovered_uuid = None;
+        self.renderer.set_hovered(None);
+        self.sidebar_index = 0;
+        self.rebuild_map();
+        self.notify_focus_change(path);
+    }
+
+    /// Tell the running scan (if any) that the user has shifted
+    /// focus. The walker reorders its priority queue so dirs under
+    /// `path` jump to the front. If there's no active scan, the
+    /// call is a cheap no-op.
+    fn notify_focus_change(&self, path: PathBuf) {
+        if let Some(handle) = self.scan_handle.as_ref() {
+            handle.set_focus(path);
         }
     }
 
     /// Navigate into the currently hovered folder
     fn navigate_into_hovered(&mut self) {
-        // Always check sidebar selection first
+        // Sidebar wins. The selected item already has a FolderId,
+        // so route through navigate_into_id and skip the path
+        // round-trip.
         let items = self.sidebar_items();
-        if let Some(item) = items.get(self.sidebar_index) {
-            if item.is_folder() {
-                if let Some(ref arena) = self.arena {
-                    if let TreeItem::Folder(id, _) = item {
-                        let path = arena.folder(*id).file.path.clone();
-                        self.navigate_into(path);
-                        return;
-                    }
-                }
-            }
+        if let Some(TreeItem::Folder(id, _)) = items.get(self.sidebar_index).copied() {
+            self.navigate_into_id(id);
+            return;
         }
 
-        // Otherwise use map hover
+        // Map hover: segment carries a path string. Resolve it
+        // through the arena so we still get the FolderId fast-path
+        // inside `navigate_into`.
         if let Some(uuid) = self.hovered_uuid {
             if let Some(ref map) = self.radial_map {
                 if let Some(segment) = self.renderer.find_segment(map, &uuid) {
@@ -854,28 +1249,60 @@ impl App {
         }
     }
 
-    /// Execute the pending delete operation
+    /// Execute the pending delete operation through the configured
+    /// [`DeleteStrategy`]. Status message reflects whether the entry
+    /// was trashed (recoverable) or permanently removed.
     fn execute_delete(&mut self) {
-        if let Some(ref path) = self.delete_path {
-            let path_buf = path.clone();
-            let is_folder = self.delete_is_folder;
-            if is_folder {
-                if let Err(e) = std::fs::remove_dir_all(&path_buf) {
-                    self.status_message = format!("Error: {}", e);
-                } else {
-                    self.status_message = format!("Deleted: {}", path.display());
+        // Multi-select batch wins over single-target if non-empty.
+        if !self.selected_paths.is_empty() {
+            let total = self.selected_paths.len();
+            let paths: Vec<PathBuf> = self.selected_paths.drain().collect();
+            let mut ok = 0usize;
+            let mut errors: Vec<String> = Vec::new();
+            for p in &paths {
+                // No inode TOCTOU guard for batch deletes — we
+                // currently capture inodes for files only and
+                // batches may include folders. The contextful
+                // error from `delete()` still surfaces failures.
+                match delete_path(&self.delete_strategy, p, None) {
+                    Ok(()) => ok += 1,
+                    Err(e) => errors.push(format!("{}: {:#}", p.display(), e)),
+                }
+            }
+            self.status_message = if errors.is_empty() {
+                format!("Deleted {} via {}", ok, self.delete_strategy.label())
+            } else {
+                format!(
+                    "Deleted {}/{}, {} failed: {}",
+                    ok,
+                    total,
+                    errors.len(),
+                    errors.first().map(String::as_str).unwrap_or("")
+                )
+            };
+            self.delete_path = None;
+            self.delete_inode = None;
+            self.mode = AppMode::Viewing;
+            self.start_scan();
+            return;
+        }
+
+        if let Some(path) = self.delete_path.take() {
+            let expected_inode = self.delete_inode.take();
+            match delete_path(&self.delete_strategy, &path, expected_inode) {
+                Ok(()) => {
+                    self.status_message = format!(
+                        "Deleted ({}): {}",
+                        self.delete_strategy.label(),
+                        path.display()
+                    );
                     self.start_scan();
                 }
-            } else {
-                if let Err(e) = std::fs::remove_file(&path_buf) {
-                    self.status_message = format!("Error: {}", e);
-                } else {
-                    self.status_message = format!("Deleted: {}", path.display());
-                    self.start_scan();
+                Err(e) => {
+                    self.status_message = format!("Delete failed: {:#}", e);
                 }
             }
         }
-        self.delete_path = None;
         self.mode = AppMode::Viewing;
     }
 
@@ -896,7 +1323,7 @@ impl App {
         };
     }
 
-    /// Move hover up in sidebar
+    /// Move hover up in sidebar.
     fn move_hover_up(&mut self) {
         if self.sidebar_index > 0 {
             self.sidebar_index -= 1;
@@ -905,17 +1332,20 @@ impl App {
         }
     }
 
-    /// Move hover down in sidebar
+    /// Move hover down in sidebar.
+    ///
+    /// Goes through `self.sidebar_items()` (which knows how to read
+    /// the live arena via `with_arena`). Pre-Phase-26 this read
+    /// `self.arena` directly — that field is `None` during a scan,
+    /// so `j` was a silent no-op until the scan completed even
+    /// though Phase 23 had already enabled navigation in
+    /// `Scanning` mode.
     fn move_hover_down(&mut self) {
-        if let Some(ref arena) = self.arena {
-            if let Some(root_id) = arena.root() {
-                let items = arena.folder_items(root_id);
-                if self.sidebar_index < items.len().saturating_sub(1) {
-                    self.sidebar_index += 1;
-                    self.sidebar_hover_index = Some(self.sidebar_index);
-                    self.sync_hover_to_canvas();
-                }
-            }
+        let n = self.sidebar_items().len();
+        if self.sidebar_index + 1 < n {
+            self.sidebar_index += 1;
+            self.sidebar_hover_index = Some(self.sidebar_index);
+            self.sync_hover_to_canvas();
         }
     }
 
@@ -929,21 +1359,133 @@ impl App {
         None
     }
 
-    /// Get segments for sidebar display
-    pub fn sidebar_items(&self) -> Vec<crate::tree::TreeItem> {
+    /// Run `f` with whichever arena is currently authoritative —
+    /// the post-scan owned `arena` or, mid-scan, the live arena
+    /// shared with the walker via `try_lock`. Returns `None` only
+    /// when neither is available (no scan started yet, or the
+    /// walker holds the lock at this exact moment).
+    ///
+    /// The closure shape exists so render code reads everything it
+    /// needs (names, paths, sizes) under a *single* lock acquisition.
+    /// The naive alternative — `sidebar_items()` followed by per-row
+    /// `app.arena.as_ref()...` — does N+1 `try_lock`s per frame and
+    /// drops into the `"?"` placeholder for any row whose lock
+    /// happened to clash with the walker.
+    pub fn with_arena<R>(&self, f: impl FnOnce(&TreeArena) -> R) -> Option<R> {
         if let Some(ref arena) = self.arena {
-            if let Some(root_id) = arena.root() {
-                return arena.folder_items(root_id);
-            }
+            return Some(f(arena));
         }
-        Vec::new()
+        let handle = self.scan_handle.as_ref()?;
+        let arena = handle.live.try_lock().ok()?;
+        Some(f(&arena))
     }
 
-    /// Update scan progress
+    /// Get segments for sidebar display, ordered by the user's
+    /// currently-selected [`SortMode`]. Shared with the tree view so
+    /// both surfaces stay consistent without duplicating the lookup.
+    ///
+    /// During a scan the post-scan `arena` is empty; fall back to a
+    /// non-blocking `try_lock` on the live `Arc<Mutex<TreeArena>>`
+    /// shared with the walker so the sidebar populates progressively.
+    /// A failed `try_lock` returns the empty list — the next frame
+    /// will retry.
+    pub fn sidebar_items(&self) -> Vec<crate::tree::TreeItem> {
+        self.with_arena(|arena| {
+            self.focus_folder_id(arena)
+                .map(|focus| arena.folder_items_sorted(focus, self.sort_mode))
+                .unwrap_or_default()
+        })
+        .unwrap_or_default()
+    }
+
+    /// Drain pending [`ScanEvent`]s from the streaming scan, if any. Called
+    /// once per frame so the status bar advances and the radial map appears
+    /// the moment the walker finishes.
     pub fn update_scan_progress(&mut self) {
-        if let Some(ref rx) = self.scan_rx {
-            while let Ok(progress) = rx.try_recv() {
-                self.scan_progress = Some(progress);
+        let Some(handle) = self.scan_handle.as_ref() else {
+            return;
+        };
+        // We need to drain events without holding a borrow of `self.scan_handle`
+        // across mutations of other `self.*` fields, so collect first.
+        let events: Vec<ScanEvent> = handle.rx.try_iter().collect();
+        let mut completed = false;
+        for event in events {
+            match event {
+                ScanEvent::Progress {
+                    files,
+                    total_size,
+                    current,
+                } => {
+                    self.scan_progress = Some(ScanProgress {
+                        files_scanned: files,
+                        total_size,
+                    });
+                    self.scan_current_path = current;
+                    // Refresh the radial from the live (mid-scan)
+                    // arena. `try_lock` keeps us off the hot path of
+                    // the walker thread; if we miss this beat we'll
+                    // pick it up at the next Progress (~80ms).
+                    self.rebuild_map_from_live();
+                }
+                ScanEvent::Warning(msg) => {
+                    // Surface the most recent warning in the status bar.
+                    // A future iteration can keep a bounded ring buffer for
+                    // a "warnings" overlay — this single-line view is fine
+                    // for v1.
+                    self.status_message = format!("warn: {}", msg);
+                }
+                ScanEvent::Complete(arena) => {
+                    self.install_completed_arena(*arena);
+                    completed = true;
+                }
+                ScanEvent::Failed(reason) => {
+                    self.status_message = format!("Scan failed: {}", reason);
+                    self.mode = AppMode::Viewing;
+                    completed = true;
+                }
+            }
+        }
+        if completed {
+            // Drop the handle; its `Drop` impl joins the worker thread.
+            self.scan_handle = None;
+            self.scan_current_path = None;
+        }
+    }
+
+    /// Install a completed arena into the App state and switch to viewing.
+    /// Crate-public so `main` can drive an `--import` flow without
+    /// kicking off a scan: it constructs the App, calls
+    /// [`Self::adopt_loaded_arena`], and the event loop runs as if a
+    /// scan had just finished.
+    pub(crate) fn adopt_loaded_arena(&mut self, arena: TreeArena, source_label: String) {
+        self.scan_handle = None;
+        self.scan_progress = None;
+        self.scan_current_path = None;
+        self.install_completed_arena(arena);
+        // Override the standard "Scanned N files" message with one
+        // that calls out the snapshot path so users know the data is
+        // not live.
+        self.status_message = format!("Loaded snapshot: {}", source_label);
+    }
+
+    /// Install a completed arena into the App state and switch to viewing.
+    fn install_completed_arena(&mut self, arena: TreeArena) {
+        match arena.root() {
+            Some(root_id) => {
+                let total_files = arena.total_file_count(root_id);
+                let total_size = arena.folder(root_id).file.size;
+                self.arena = Some(arena);
+                self.mode = AppMode::Viewing;
+                self.rebuild_map();
+                self.status_message = format!(
+                    "Scanned {} files ({})",
+                    total_files,
+                    format_size(total_size)
+                );
+            }
+            None => {
+                self.status_message = "Scan completed but produced no root entry".to_string();
+                self.mode = AppMode::Viewing;
             }
         }
     }
@@ -952,7 +1494,7 @@ impl App {
     pub fn status_text(&self) -> String {
         match self.mode {
             AppMode::Scanning => {
-                if let Some(ref progress) = self.scan_progress {
+                let header = if let Some(ref progress) = self.scan_progress {
                     format!(
                         "Scanning... {} files ({})",
                         progress.files_scanned,
@@ -960,6 +1502,28 @@ impl App {
                     )
                 } else {
                     "Scanning...".to_string()
+                };
+                // Append the most recent path so the user can see what the
+                // walker is on, truncated to a sensible width.
+                match &self.scan_current_path {
+                    Some(path) => {
+                        let display = path.display().to_string();
+                        let truncated: String = if display.chars().count() > 60 {
+                            let tail: String = display
+                                .chars()
+                                .rev()
+                                .take(57)
+                                .collect::<Vec<_>>()
+                                .into_iter()
+                                .rev()
+                                .collect();
+                            format!("...{}", tail)
+                        } else {
+                            display
+                        };
+                        format!("{}  {}", header, truncated)
+                    }
+                    None => header,
                 }
             }
             AppMode::Viewing => {
