@@ -62,7 +62,7 @@ yay -S radisk
 **Quick install (macOS / Linux)**
 
 ```sh
-curl -sSf https://raw.githubusercontent.com/mimobn/radisk/main/install.sh | sh
+curl -sSf https://raw.githubusercontent.com/mimobn/radisk/master/install.sh | sh
 ```
 
 Installs Rust if it isn't present and drops the binary in
